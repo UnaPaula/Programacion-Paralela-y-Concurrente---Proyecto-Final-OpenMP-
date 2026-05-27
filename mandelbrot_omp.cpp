@@ -416,58 +416,65 @@ int main() {
     std::cout << "  Procesadores    : " << omp_get_num_procs() << "\n";
     std::cout << "═══════════════════════════════════════════════════════\n\n";
     Image original;
+    Timer total;
 
-    Timer total; total.start();
-    // ── PASO 1 ──────────────────────────────────
-    std::cout << "[ PASO 1 ] Generando fractal Mandelbrot...\n";
-    Timer tp; tp.start();
-    original = generate_mandelbrot(schedule, chunk);
-    std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
-    std::cout << "[ PASO 1.1 ] Conteo de pixeles - local...\n";
-    tp.start();
-    print_stats(original, "  Original");
-    std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
+    for (int nthreads = 1; nthreads <= 16; ++nthreads) {
+        omp_set_num_threads(nthreads);
+        total.start();
 
-    // ── PASO 2 ──────────────────────────────────
-    std::cout << "\n[ PASO 2 ] Guardando mandelbrot_8k.ppm...\n";
-    {
-        Timer tw; tw.start();
-        if (save_ppm("mandelbrot_8k.ppm", original))
-            std::cout << "  → Guardado en " << tw.elapsed_s() << "s  ("
-            << (WIDTH*HEIGHT*3)/1048576 << " MB)\n";
+        std::cout << "═══════════════════════════════════════════════════════\n";
+        std::cout << "  Hilos: " << nthreads << "\n";
+        // ── PASO 1 ──────────────────────────────────
+        std::cout << "[ PASO 1 ] Generando fractal Mandelbrot...\n";
+        Timer tp; tp.start();
+        original = generate_mandelbrot(schedule, chunk);
+        std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
+        std::cout << "[ PASO 1.1 ] Conteo de pixeles - local...\n";
+        tp.start();
+        print_stats(original, "  Original");
+        std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
+
+        // ── PASO 2 ──────────────────────────────────
+        std::cout << "\n[ PASO 2 ] Guardando mandelbrot_8k.ppm...\n";
+        {
+            Timer tw; tw.start();
+            if (save_ppm("mandelbrot_8k.ppm", original))
+                std::cout << "  → Guardado en " << tw.elapsed_s() << "s  ("
+                << (WIDTH*HEIGHT*3)/1048576 << " MB)\n";
+        }
+
+        // ── PASO 3 ──────────────────────────────────
+        std::cout << "\n[ PASO 3 ] Desenfoque Gaussiano (radio=15, sigma=8)...\n";
+        const int   GAUSS_RADIUS = 15;
+        const float GAUSS_SIGMA  = 8.0f;
+        Timer tg; tg.start();
+        Image blurred = gaussian_blur_separable(original, GAUSS_RADIUS, GAUSS_SIGMA);
+        std::cout << "  → Tiempo Gaussiano: " << tg.elapsed_s() << "s\n";
+
+        // ── PASO 4 ──────────────────────────────────
+        std::cout << "\n[ PASO 4 ] Filtro Sobel + realce de bordes...\n";
+        Timer ts; ts.start();
+        Image filtered = sobel_edge_highlight(original, blurred);
+        std::cout << "  → Tiempo Sobel: " << ts.elapsed_s() << "s\n";
+        print_stats(filtered, "  Filtrada");
+
+        // ── PASO 5 ──────────────────────────────────
+        std::cout << "\n[ PASO 5 ] Guardando mandelbrot_8k_filtro.ppm...\n";
+        {
+            Timer tw; tw.start();
+            if (save_ppm("mandelbrot_8k_filtro.ppm", filtered))
+                std::cout << "  → Guardado en " << tw.elapsed_s() << "s\n";
+        }
+
+        double total_s = total.elapsed_s();
+        std::cout << "\n═══════════════════════════════════════════════════════\n";
+        std::cout << "  TIEMPO TOTAL : " << std::fixed << std::setprecision(2)
+        << total_s << " segundos  (" << nthreads << " hilos)\n";
+        std::cout << "  Speedup teórico máximo ~" << nthreads << "x  (Ley de Amdahl)\n";
+        std::cout << "  Archivos generados:\n";
+        std::cout << "    mandelbrot_8k.ppm         (original)\n";
+        std::cout << "    mandelbrot_8k_filtro.ppm  (Gaussiano + Sobel)\n";
+        std::cout << "═══════════════════════════════════════════════════════\n";
     }
-
-    // ── PASO 3 ──────────────────────────────────
-    std::cout << "\n[ PASO 3 ] Desenfoque Gaussiano (radio=15, sigma=8)...\n";
-    const int   GAUSS_RADIUS = 15;
-    const float GAUSS_SIGMA  = 8.0f;
-    Timer tg; tg.start();
-    Image blurred = gaussian_blur_separable(original, GAUSS_RADIUS, GAUSS_SIGMA);
-    std::cout << "  → Tiempo Gaussiano: " << tg.elapsed_s() << "s\n";
-
-    // ── PASO 4 ──────────────────────────────────
-    std::cout << "\n[ PASO 4 ] Filtro Sobel + realce de bordes...\n";
-    Timer ts; ts.start();
-    Image filtered = sobel_edge_highlight(original, blurred);
-    std::cout << "  → Tiempo Sobel: " << ts.elapsed_s() << "s\n";
-    print_stats(filtered, "  Filtrada");
-
-    // ── PASO 5 ──────────────────────────────────
-    std::cout << "\n[ PASO 5 ] Guardando mandelbrot_8k_filtro.ppm...\n";
-    {
-        Timer tw; tw.start();
-        if (save_ppm("mandelbrot_8k_filtro.ppm", filtered))
-            std::cout << "  → Guardado en " << tw.elapsed_s() << "s\n";
-    }
-
-    double total_s = total.elapsed_s();
-    std::cout << "\n═══════════════════════════════════════════════════════\n";
-    std::cout << "  TIEMPO TOTAL : " << std::fixed << std::setprecision(2)
-    << total_s << " segundos  (" << nthreads << " hilos)\n";
-    std::cout << "  Speedup teórico máximo ~" << nthreads << "x  (Ley de Amdahl)\n";
-    std::cout << "  Archivos generados:\n";
-    std::cout << "    mandelbrot_8k.ppm         (original)\n";
-    std::cout << "    mandelbrot_8k_filtro.ppm  (Gaussiano + Sobel)\n";
-    std::cout << "═══════════════════════════════════════════════════════\n";
     return 0;
 }
