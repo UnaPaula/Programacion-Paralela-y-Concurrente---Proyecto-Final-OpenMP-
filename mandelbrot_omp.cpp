@@ -59,6 +59,7 @@
 #include <string>
 #include <omp.h>
 #include <cstdint>
+#include <unordered_map>
 
 using namespace std::chrono;
 
@@ -349,19 +350,48 @@ bool save_ppm(const std::string& path, const Image& img) {
 }
 
 // ─────────────────────────────────────────────
-//  Estadísticas — reducción paralela de sumas
+//  Conteo de pixeles
 // ─────────────────────────────────────────────
 void print_stats(const Image& img, const char* label) {
-    long long sr = 0, sg = 0, sb = 0;
-    #pragma omp parallel for schedule(static) reduction(+:sr,sg,sb)
+    int nthreads = omp_get_max_threads();
+    std::vector<std::unordered_map<uint32_t, int>> local_maps(nthreads);
+
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < (int)img.size(); ++i) {
-        sr += img[i].r;  sg += img[i].g;  sb += img[i].b;
+        uint32_t key = ((uint32_t)img[i].r << 16) |
+        ((uint32_t)img[i].g <<  8) |
+        (uint32_t)img[i].b;
+
+        // Cada hilo escribe en su propio mapa — sin contención
+        local_maps[omp_get_thread_num()][key]++;
     }
-    double n = img.size();
+
+    // Fusionar todos los mapas locales en uno global (secuencial)
+    std::unordered_map<uint32_t, int> color_count;
+    for (auto& m : local_maps)
+        for (auto& [key, count] : m)
+            color_count[key] += count;
+
     std::cout << label
-    << "  avg R=" << std::fixed << std::setprecision(2) << sr/n
-    << "  G="     << sg/n
-    << "  B="     << sb/n << '\n';
+    << "  colores únicos: " << color_count.size() << '\n';
+}
+
+void print_stats_critical(const Image& img, const char* label) {
+    std::unordered_map<uint32_t, int> color_count;
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < (int)img.size(); ++i) {
+        // Empaquetar RGB en un solo entero: 0x00RRGGBB
+        uint32_t key = ((uint32_t)img[i].r << 16) |
+        ((uint32_t)img[i].g <<  8) |
+        (uint32_t)img[i].b;
+
+        #pragma omp critical
+        color_count[key]++;
+    }
+
+    std::cout << label
+    << "  colores únicos: " << color_count.size() << '\n';
 }
 
 // ─────────────────────────────────────────────
@@ -369,13 +399,8 @@ void print_stats(const Image& img, const char* label) {
 // ─────────────────────────────────────────────
 int main() {
 
-    int chunks[] = {1,2,4,8,16,32,64,128};
-    omp_sched_t schedules[] = {
-        omp_sched_static,
-        omp_sched_dynamic,
-        omp_sched_guided
-    };
-    std::string schds[] = {"static","dynamic","guided"};
+    int chunk = 4;
+    omp_sched_t schedule = omp_sched_dynamic;
 
     int nthreads = omp_get_max_threads();
     std::cout << "═══════════════════════════════════════════════════════\n";
@@ -388,21 +413,22 @@ int main() {
     Image original;
 
     Timer total; total.start();
-    for(int i = 0; i<3; i++){
-        std::cout << "═══════════════════════════════════════════════════════\n";
-        std::cout << "Planificador: " << schds[i] << std::endl;
-        for(int c = 0; c < 8; c++) {
-            std::cout << "Chunk size: " << chunks[c] << std::endl;
-            // ── PASO 1 ──────────────────────────────────
-            std::cout << "[ PASO 1 ] Generando fractal Mandelbrot...\n";
-            Timer tp; tp.start();
-            original = generate_mandelbrot(schedules[i], chunks[c]);
-            std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
-            print_stats(original, "  Original");
-            std::cout << std::endl;
+    omp_set_num_threads(16);
+    // ── PASO 1 ──────────────────────────────────
+    std::cout << "[ PASO 1 ] Generando fractal Mandelbrot...\n";
+    Timer tp; tp.start();
+    original = generate_mandelbrot(schedule, chunk);
+    std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
+    std::cout << "[ PASO 1.1 ] Conteo de pixeles - local...\n";
+    tp.start();
+    print_stats(original, "  Original");
+    std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
+    std::cout << "[ PASO 1.2 ] Conteo de pixeles - critical...\n";
+    tp.start();
+    print_stats_critical(original, "  Original");
+    std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
+    std::cout << std::endl;
 
-        }
-    }
     // ── PASO 2 ──────────────────────────────────
     std::cout << "\n[ PASO 2 ] Guardando mandelbrot_8k.ppm...\n";
     {
