@@ -205,73 +205,78 @@ Image generate_mandelbrot(omp_sched_t schd, int chunk) {
 //  solo lectura, thread-safe sin copia.
 // ══════════════════════════════════════════════
 Image gaussian_blur_separable(const Image& src, int radius, float sigma) {
-    const int ksize = 2 * radius + 1;
-
-    // Kernel 1D (construido en serie, luego solo lectura)
-    std::vector<float> k1d(ksize);
-    {
-        float s = 0;
-        for (int i = -radius; i <= radius; ++i) {
-            k1d[i + radius] = std::exp(-(float)(i*i) / (2.0f*sigma*sigma));
-            s += k1d[i + radius];
-        }
-        for (auto& v : k1d) v /= s;
-    }
-    const float* kp = k1d.data();   // puntero const para el paralelo
-
     const int N = WIDTH * HEIGHT;
+
+    // Kernel gaussiano 1D
+    std::vector<float> k1d(2 * radius + 1);
+    float sum = 0;
+    for (int i = -radius; i <= radius; ++i) {
+        k1d[i + radius] = std::exp(-0.5f * (i * i) / (sigma * sigma));
+        sum += k1d[i + radius];
+    }
+    for (auto& v : k1d) v /= sum;
+    const float* kp = k1d.data();
+
+    // SOA para permitir vectorización (AOS = RGBRGB no es vectorizable)
+    std::vector<float> inR(N), inG(N), inB(N);
+    #pragma omp parallel for simd schedule(static)
+    for (int i = 0; i < N; ++i) {
+        inR[i] = src[i].r;
+        inG[i] = src[i].g;
+        inB[i] = src[i].b;
+    }
+
     std::vector<float> tmpR(N), tmpG(N), tmpB(N);
     std::vector<float> outR(N), outG(N), outB(N);
 
-    Timer t; t.start();
-
-    // ── Pasada horizontal ──
+    // Pasada horizontal — SPMD: un hilo por fila, SIMD: varios px por ciclo
     #pragma omp parallel for schedule(static)
     for (int py = 0; py < HEIGHT; ++py) {
+        #pragma omp simd
         for (int px = 0; px < WIDTH; ++px) {
             float r = 0, g = 0, b = 0;
             for (int k = -radius; k <= radius; ++k) {
-                int sx = std::clamp(px + k, 0, WIDTH - 1);
-                const RGB& pix = src[py * WIDTH + sx];
-                float w = kp[k + radius];
-                r += pix.r * w;  g += pix.g * w;  b += pix.b * w;
+                int   sx  = std::clamp(px + k, 0, WIDTH - 1);
+                float w   = kp[k + radius];
+                r += inR[py * WIDTH + sx] * w;
+                g += inG[py * WIDTH + sx] * w;
+                b += inB[py * WIDTH + sx] * w;
             }
-            int idx = py * WIDTH + px;
-            tmpR[idx] = r;  tmpG[idx] = g;  tmpB[idx] = b;
+            tmpR[py * WIDTH + px] = r;
+            tmpG[py * WIDTH + px] = g;
+            tmpB[py * WIDTH + px] = b;
         }
-        if (omp_get_thread_num() == 0 && (py % 100 == 0 || py == HEIGHT-1))
-            progress_bar("Gauss horizontal   ", py + 1, HEIGHT, t.elapsed_s());
     }
-    progress_bar("Gauss horizontal   ", HEIGHT, HEIGHT, t.elapsed_s());
 
-    // ── Pasada vertical ──
+    // Pasada vertical — misma estructura
     #pragma omp parallel for schedule(static)
     for (int py = 0; py < HEIGHT; ++py) {
+        #pragma omp simd
         for (int px = 0; px < WIDTH; ++px) {
             float r = 0, g = 0, b = 0;
             for (int k = -radius; k <= radius; ++k) {
-                int sy  = std::clamp(py + k, 0, HEIGHT - 1);
-                int idx = sy * WIDTH + px;
-                float w = kp[k + radius];
-                r += tmpR[idx] * w;  g += tmpG[idx] * w;  b += tmpB[idx] * w;
+                int   sy  = std::clamp(py + k, 0, HEIGHT - 1);
+                float w   = kp[k + radius];
+                r += tmpR[sy * WIDTH + px] * w;
+                g += tmpG[sy * WIDTH + px] * w;
+                b += tmpB[sy * WIDTH + px] * w;
             }
-            int oi = py * WIDTH + px;
-            outR[oi] = r;  outG[oi] = g;  outB[oi] = b;
+            outR[py * WIDTH + px] = r;
+            outG[py * WIDTH + px] = g;
+            outB[py * WIDTH + px] = b;
         }
-        if (omp_get_thread_num() == 0 && (py % 100 == 0 || py == HEIGHT-1))
-            progress_bar("Gauss vertical     ", py + 1, HEIGHT, t.elapsed_s());
     }
-    progress_bar("Gauss vertical     ", HEIGHT, HEIGHT, t.elapsed_s());
 
-    // ── Convertir float → uint8 ──
+    // SOA → AOS
     Image result(N);
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for simd schedule(static)
     for (int i = 0; i < N; ++i)
         result[i] = {
             (uint8_t)std::clamp((int)outR[i], 0, 255),
             (uint8_t)std::clamp((int)outG[i], 0, 255),
             (uint8_t)std::clamp((int)outB[i], 0, 255)
         };
+
     return result;
 }
 
@@ -413,7 +418,6 @@ int main() {
     Image original;
 
     Timer total; total.start();
-    omp_set_num_threads(16);
     // ── PASO 1 ──────────────────────────────────
     std::cout << "[ PASO 1 ] Generando fractal Mandelbrot...\n";
     Timer tp; tp.start();
@@ -423,11 +427,6 @@ int main() {
     tp.start();
     print_stats(original, "  Original");
     std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
-    std::cout << "[ PASO 1.2 ] Conteo de pixeles - critical...\n";
-    tp.start();
-    print_stats_critical(original, "  Original");
-    std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
-    std::cout << std::endl;
 
     // ── PASO 2 ──────────────────────────────────
     std::cout << "\n[ PASO 2 ] Guardando mandelbrot_8k.ppm...\n";
