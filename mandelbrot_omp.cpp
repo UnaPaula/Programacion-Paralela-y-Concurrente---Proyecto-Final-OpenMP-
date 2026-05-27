@@ -58,6 +58,9 @@
 #include <algorithm>
 #include <string>
 #include <omp.h>
+#include <cstdint>
+
+using namespace std::chrono;
 
 // ─────────────────────────────────────────────
 //  Dimensiones (8K = 7680×4320)
@@ -83,10 +86,10 @@ using Image = std::vector<RGB>;
 //  Cronómetro con omp_get_wtime (wall-clock real)
 // ─────────────────────────────────────────────
 class Timer {
-    double t0 = 0;
+    high_resolution_clock::time_point t0;
 public:
-    void   start()           { t0 = omp_get_wtime(); }
-    double elapsed_s() const { return omp_get_wtime() - t0; }
+    void   start()           { t0 = high_resolution_clock::now(); }
+    double elapsed_s() const { return duration<double>(high_resolution_clock::now() - t0).count(); }
 };
 
 // ─────────────────────────────────────────────
@@ -101,8 +104,8 @@ void progress_bar(const char* label, int done, int total, double elapsed) {
         std::cout << (i < filled ? '#' : '-');
     double eta = (done > 0 && frac < 1.0) ? elapsed / frac * (1.0 - frac) : 0.0;
     std::cout << "] " << std::fixed << std::setprecision(1)
-              << frac * 100.0 << "%  "
-              << elapsed << "s  ETA " << eta << "s   " << std::flush;
+    << frac * 100.0 << "%  "
+    << elapsed << "s  ETA " << eta << "s   " << std::flush;
     if (done == total) std::cout << '\n';
 }
 
@@ -125,7 +128,7 @@ static RGB iter_to_color(double smooth) {
     int lo = 0;
     for (int i = 0; i < N - 1; ++i)
         if (t >= stops[i].pos && t < stops[i+1].pos) { lo = i; break; }
-    double range = stops[lo+1].pos - stops[lo].pos;
+        double range = stops[lo+1].pos - stops[lo].pos;
     double u = (range > 0.0) ? (t - stops[lo].pos) / range : 0.0;
     auto lerp = [&](double a, double b){ return a + u*(b-a); };
     return {
@@ -145,16 +148,17 @@ static RGB iter_to_color(double smooth) {
 //  Sin race conditions: cada hilo escribe en filas
 //  distintas del array img.
 // ══════════════════════════════════════════════
-Image generate_mandelbrot() {
+Image generate_mandelbrot(omp_sched_t schd, int chunk) {
     Image img(WIDTH * HEIGHT);
     Timer t; t.start();
     const double asp = (double)WIDTH / HEIGHT;
 
     // Barra de progreso atómica (hilo 0 la actualiza)
     // Usamos una variable compartida para el último py visible
-    int last_reported = -1;
 
-    #pragma omp parallel for schedule(static)
+    omp_set_schedule(omp_sched_dynamic, chunk);
+
+    #pragma omp parallel for schedule(runtime)
     for (int py = 0; py < HEIGHT; ++py) {
         for (int px = 0; px < WIDTH; ++px) {
             double cx = CENTER_X + (px / (double)WIDTH  - 0.5) * ZOOM * asp * 2.0;
@@ -270,6 +274,7 @@ Image gaussian_blur_separable(const Image& src, int radius, float sigma) {
     return result;
 }
 
+
 // ══════════════════════════════════════════════
 //  PASO 3 — Filtro Sobel + realce de bordes
 //
@@ -303,12 +308,12 @@ Image sobel_edge_highlight(const Image& src, const Image& blurred) {
         for (int px = 1; px < WIDTH - 1; ++px) {
             float sx = 0, sy = 0;
             for (int dy = -1; dy <= 1; ++dy)
-            for (int dx = -1; dx <= 1; ++dx) {
-                float g = gray[(py+dy)*WIDTH + (px+dx)];
-                sx += g * Gx[dy+1][dx+1];
-                sy += g * Gy[dy+1][dx+1];
-            }
-            float mag = std::sqrt(sx*sx + sy*sy);
+                for (int dx = -1; dx <= 1; ++dx) {
+                    float g = gray[(py+dy)*WIDTH + (px+dx)];
+                    sx += g * Gx[dy+1][dx+1];
+                    sy += g * Gy[dy+1][dx+1];
+                }
+                float mag = std::sqrt(sx*sx + sy*sy);
             edges[py*WIDTH + px] = mag;
             if (mag > maxEdge) maxEdge = mag;  // safe: cláusula reduction
         }
@@ -354,15 +359,24 @@ void print_stats(const Image& img, const char* label) {
     }
     double n = img.size();
     std::cout << label
-              << "  avg R=" << std::fixed << std::setprecision(2) << sr/n
-              << "  G="     << sg/n
-              << "  B="     << sb/n << '\n';
+    << "  avg R=" << std::fixed << std::setprecision(2) << sr/n
+    << "  G="     << sg/n
+    << "  B="     << sb/n << '\n';
 }
 
 // ─────────────────────────────────────────────
 //  MAIN
 // ─────────────────────────────────────────────
 int main() {
+
+    int chunks[] = {1,2,4,8,16,32,64,128};
+    omp_sched_t schedules[] = {
+        omp_sched_static,
+        omp_sched_dynamic,
+        omp_sched_guided
+    };
+    std::string schds[] = {"static","dynamic","guided"};
+
     int nthreads = omp_get_max_threads();
     std::cout << "═══════════════════════════════════════════════════════\n";
     std::cout << "  Mandelbrot 8K + Convolución 2D  — OpenMP C++\n";
@@ -371,23 +385,31 @@ int main() {
     std::cout << "  Hilos OpenMP    : " << nthreads << "\n";
     std::cout << "  Procesadores    : " << omp_get_num_procs() << "\n";
     std::cout << "═══════════════════════════════════════════════════════\n\n";
+    Image original;
 
     Timer total; total.start();
+    for(int i = 0; i<3; i++){
+        std::cout << "═══════════════════════════════════════════════════════\n";
+        std::cout << "Planificador: " << schds[i] << std::endl;
+        for(int c = 0; c < 8; c++) {
+            std::cout << "Chunk size: " << chunks[c] << std::endl;
+            // ── PASO 1 ──────────────────────────────────
+            std::cout << "[ PASO 1 ] Generando fractal Mandelbrot...\n";
+            Timer tp; tp.start();
+            original = generate_mandelbrot(schedules[i], chunks[c]);
+            std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
+            print_stats(original, "  Original");
+            std::cout << std::endl;
 
-    // ── PASO 1 ──────────────────────────────────
-    std::cout << "[ PASO 1 ] Generando fractal Mandelbrot...\n";
-    Timer tp; tp.start();
-    Image original = generate_mandelbrot();
-    std::cout << "  → Tiempo: " << tp.elapsed_s() << "s\n";
-    print_stats(original, "  Original");
-
+        }
+    }
     // ── PASO 2 ──────────────────────────────────
     std::cout << "\n[ PASO 2 ] Guardando mandelbrot_8k.ppm...\n";
     {
         Timer tw; tw.start();
         if (save_ppm("mandelbrot_8k.ppm", original))
             std::cout << "  → Guardado en " << tw.elapsed_s() << "s  ("
-                      << (WIDTH*HEIGHT*3)/1048576 << " MB)\n";
+            << (WIDTH*HEIGHT*3)/1048576 << " MB)\n";
     }
 
     // ── PASO 3 ──────────────────────────────────
@@ -416,7 +438,7 @@ int main() {
     double total_s = total.elapsed_s();
     std::cout << "\n═══════════════════════════════════════════════════════\n";
     std::cout << "  TIEMPO TOTAL : " << std::fixed << std::setprecision(2)
-              << total_s << " segundos  (" << nthreads << " hilos)\n";
+    << total_s << " segundos  (" << nthreads << " hilos)\n";
     std::cout << "  Speedup teórico máximo ~" << nthreads << "x  (Ley de Amdahl)\n";
     std::cout << "  Archivos generados:\n";
     std::cout << "    mandelbrot_8k.ppm         (original)\n";
